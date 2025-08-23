@@ -112,17 +112,17 @@ def custom_login_view(request):
         "message": "Login successful",
         "is_superuser": user.is_superuser,
         "is_staff": user.is_staff,
-        # tokens also in response for convenience/debugging
         "access_token": str(refresh.access_token),
         "refresh_token": str(refresh),
     })
 
+    # set cookies
     response.set_cookie(
         key="access_token",
         value=str(refresh.access_token),
         httponly=True,
-        secure=False,      # False for local dev over HTTP
-        samesite="Lax",    # Lax for local dev
+        secure=False,   # set True in production with HTTPS
+        samesite="Lax",
         path="/",
     )
     response.set_cookie(
@@ -134,7 +134,233 @@ def custom_login_view(request):
         path="/",
     )
 
+    # ✅ you MUST return this
     return response
+
+def resend_otp(request):
+    if request.method == 'POST':
+        data = json.loads(request.body)
+        email = data.get('email')
+
+        if not email:
+            return JsonResponse({"error": "Email is required."}, status=400)
+
+        cached_data = cache.get(email)
+
+        if not cached_data:
+            return JsonResponse({"error": "No registration data found. Please register again."}, status=400)
+
+        # Generate new OTP
+        otp = str(random.randint(100000, 999999))
+        cached_data['otp'] = otp
+
+        # Update cache with new OTP (valid for 60 sec again)
+        cache.set(email, cached_data, timeout=60)
+
+        # Send email again
+        send_mail(
+            subject="Your New OTP Verification Code",
+            message=f"Hello {cached_data['full_name']}, your new OTP is: {otp}",
+            from_email="abhisheksavalgi601@gmail.com",
+            recipient_list=[email],
+            fail_silently=False,
+        )
+
+        return JsonResponse({"message": "A new OTP has been sent to your email."}, status=200)
+
+    else:
+        return JsonResponse({"error": "Only POST method is allowed."}, status=405)
+
+
+    return response
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from .authentication import CookieJWTAuthentication  # ✅ custom cookie-based JWT auth
+
+@api_view(["GET"])
+@authentication_classes([CookieJWTAuthentication])  # ✅ read JWT from cookies
+@permission_classes([IsAuthenticated])
+def get_profile(request):
+    """
+    API to fetch logged-in user profile details
+    """
+    user = request.user
+    data = {
+        "id": user.id,
+        "full_name": getattr(user, "full_name", ""),
+        "email": user.email,
+        "mobile_number": getattr(user, "mobile_number", ""),
+        "gender": getattr(user, "gender", ""),
+        "ward_number": getattr(user, "ward_number", ""),
+        "home_number": getattr(user, "home_number", ""),
+        "live_location": getattr(user, "live_location", ""),
+    }
+    return Response(data)
+
+
+
+
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+from django.core.mail import send_mail
+from django.utils import timezone
+import random
+from .authentication import CookieJWTAuthentication
+
+@api_view(["PUT"])
+@authentication_classes([CookieJWTAuthentication])  
+@permission_classes([IsAuthenticated])  
+def update_profile(request):
+    """
+    API to update logged-in user profile details
+    """
+    user = request.user
+    data = request.data
+
+    # Update normal fields
+    user.full_name = data.get("full_name", user.full_name)
+    user.mobile_number = data.get("mobile_number", user.mobile_number)
+    user.gender = data.get("gender", user.gender)
+    user.ward_number = data.get("ward_number", user.ward_number)
+    user.home_number = data.get("home_number", user.home_number)
+    user.live_location = data.get("live_location", user.live_location)
+
+    # Handle email change
+    new_email = data.get("email")
+    if new_email and new_email != user.email:
+        if user.pending_email and user.pending_email != new_email:
+            return Response({"error": "You have already requested an email change. Please verify OTP first."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if User.objects.filter(email=new_email).exists():
+            return Response({"error": "This email is already in use"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Generate OTP for email change
+        otp = str(random.randint(100000, 999999))
+        user.pending_email = new_email
+        user.email_otp = otp
+        user.email_otp_created_at = timezone.now()
+        
+        # Send OTP to new email
+        send_mail(
+            subject="Email Change OTP",
+            message=f"Hello {user.full_name}, your OTP to change email is: {otp}",
+            from_email="abhisheksavalgi601@gmail.com",
+            recipient_list=[new_email],
+            fail_silently=False,
+        )
+
+    user.save()
+
+    response_data = {
+        "id": user.id,
+        "full_name": user.full_name,
+        "email": user.email,  # current email, will change after OTP verification
+        "mobile_number": user.mobile_number,
+        "gender": user.gender,
+        "ward_number": user.ward_number,
+        "home_number": user.home_number,
+        "live_location": user.live_location,
+    }
+
+    if new_email and new_email != user.email:
+        response_data["message"] = "OTP sent to new email. Please verify to update email."
+
+    return Response(response_data, status=status.HTTP_200_OK)
+
+
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+from django.core.mail import send_mail
+from django.utils import timezone
+import random
+from .authentication import CookieJWTAuthentication
+from .models import User
+
+@api_view(["POST"])
+@authentication_classes([CookieJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def request_email_change(request):
+    """
+    Request OTP for changing email
+    """
+    user = request.user
+    new_email = request.data.get("email")
+
+    if not new_email:
+        return Response({"error": "New email is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if new_email == user.email:
+        return Response({"error": "New email must be different from current email"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if User.objects.filter(email=new_email).exists():
+        return Response({"error": "This email is already in use"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Generate OTP
+    otp = str(random.randint(100000, 999999))
+    user.pending_email = new_email
+    user.email_otp = otp
+    user.email_otp_created_at = timezone.now()
+    user.save()
+
+    # Send OTP to new email
+    send_mail(
+        subject="Email Change OTP",
+        message=f"Hello {user.full_name}, your OTP to change email is: {otp}",
+        from_email="abhisheksavalgi601@gmail.com",
+        recipient_list=[new_email],
+        fail_silently=False,
+    )
+
+    return Response({"message": "OTP sent to new email. Please verify to update email."}, status=status.HTTP_200_OK)
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+from django.utils import timezone
+from .authentication import CookieJWTAuthentication
+
+@api_view(["POST"])
+@authentication_classes([CookieJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def verify_email_otp(request):
+    """
+    Verify OTP and update user email
+    """
+    user = request.user
+    otp_input = request.data.get("otp")
+
+    if not otp_input:
+        return Response({"error": "OTP is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Check if OTP exists and not expired (10 min validity)
+    if not user.email_otp or not user.pending_email:
+        return Response({"error": "No pending email change request"}, status=status.HTTP_400_BAD_REQUEST)
+
+    time_diff = timezone.now() - user.email_otp_created_at
+    if time_diff.total_seconds() > 600:  # 10 minutes
+        user.pending_email = None
+        user.email_otp = None
+        user.email_otp_created_at = None
+        user.save()
+        return Response({"error": "OTP expired. Please request again"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if otp_input != user.email_otp:
+        return Response({"error": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Update email
+    user.email = user.pending_email
+    user.pending_email = None
+    
+    user.email_otp = None
+    user.email_otp_created_at = None
+    user.save()
+
+    return Response({"message": "Email updated successfully"}, status=status.HTTP_200_OK)
 
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -333,3 +559,110 @@ def complaints_chart_data(request):
         chart_data[item['status']][month_index] = item['count']
 
     return Response(chart_data)
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404
+from Myapp.models import Document
+
+def document_detail_api(request, id):  # <-- matches <int:id> in urls.py
+    doc = get_object_or_404(Document, id=id)
+
+    data = {
+        "id": doc.id,
+        "name": doc.name,
+        "required_documents": doc.required_documents,
+        "process": doc.process,
+        "office_address": doc.office_address,
+        "office_contact": doc.office_contact,
+        "office_hours": doc.office_hours,
+        "image": doc.image.url if doc.image else None
+    }
+    return JsonResponse(data)
+# Myapp/views.py
+from django.http import JsonResponse
+from Myapp.models import Document
+
+def documents_list_api(request):
+    docs = Document.objects.all()
+    data = [{"id": doc.id, "name": doc.name} for doc in docs]
+    return JsonResponse(data, safe=False)
+# Myapp/views.py
+from django.views.decorators.csrf import csrf_exempt
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import IsAdminUser
+from rest_framework.response import Response
+from rest_framework import status
+from .models import Document
+from .authentication import CookieJWTAuthentication
+
+@csrf_exempt
+@api_view(['POST'])
+@authentication_classes([CookieJWTAuthentication])
+@permission_classes([IsAdminUser])
+def add_document_api(request):
+    """
+    API to add a new Document (superuser only) without using serializer.
+    """
+    # Required fields
+    name = request.data.get('name')
+    required_documents = request.data.get('required_documents')
+    process = request.data.get('process')
+    office_address = request.data.get('office_address')
+    office_contact = request.data.get('office_contact')
+    office_hours = request.data.get('office_hours')
+    image = request.FILES.get('image')  # optional
+
+    # Validation
+    missing_fields = []
+    for field_name, value in [
+        ('name', name),
+        ('required_documents', required_documents),
+        ('process', process),
+        ('office_address', office_address),
+        ('office_contact', office_contact),
+        ('office_hours', office_hours),
+    ]:
+        if not value:
+            missing_fields.append(field_name)
+
+    if missing_fields:
+        return Response(
+            {"error": f"Missing required fields: {', '.join(missing_fields)}"},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Check if document with same name exists
+    if Document.objects.filter(name=name).exists():
+        return Response(
+            {"error": "Document with this name already exists."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Create and save document
+    document = Document(
+        name=name,
+        required_documents=required_documents,
+        process=process,
+        office_address=office_address,
+        office_contact=office_contact,
+        office_hours=office_hours,
+        image=image
+    )
+    document.save()
+
+    return Response(
+        {
+            "message": "Document added successfully",
+            "document": {
+                "id": document.id,
+                "name": document.name,
+                "slug": document.slug,
+                "required_documents": document.required_documents,
+                "process": document.process,
+                "office_address": document.office_address,
+                "office_contact": document.office_contact,
+                "office_hours": document.office_hours,
+                "image": document.image.url if document.image else None
+            }
+        },
+        status=status.HTTP_201_CREATED
+    )
